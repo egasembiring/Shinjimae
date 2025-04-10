@@ -1,175 +1,210 @@
-import { makeWASocket, DisconnectReason, useMultiFileAuthState } from "@whiskeysockets/baileys";
-import MAIN_LOGGER from "pino";
-import { writeLog, newline, readCount, writeCount } from "../log/index.js";
-import moment from "moment";
-import qrcodeTerminal from "qrcode-terminal";
+import makeWASocket, { DisconnectReason, useMultiFileAuthState } from "@whiskeysockets/baileys"
+import MAIN_LOGGER from 'pino'
+import {writeLog, newline, readCount, writeCount} from "../log/index.js"
 
 export default class Whatsapp {
-  constructor() {
-    this.logger = MAIN_LOGGER({ level: "silent" });
-    this.sock = null;
-    this.status = 0;
-    this.qr = null;
-    this.count = 0;
-    this.pairingCode = null;
-    this.autoDeleteInterval = 5;
-    this.deletePatterns = [
-      /wa\.me\/settings/gi,
-      /Verifikasi anda : \d+/gi,
-      /S82M7rFoBE/gi,
-    ];
-    this.autoDeleteTimer = null;
-    this.readCount();
-  }
+    constructor() {
+        this.logger = MAIN_LOGGER.default()
+        this.logger.level = 'silent' // Bisa diubah ke silent atau error
+        this.sock = null
+        this.status = 0
+        this.qr = null
+        this.pairing = null
+        this.count = 0
 
-  async readCount() {
-    this.count = await readCount();
-  }
+        // Konfigurasi auto delete
+        this.autoDeleteEnabled = true                  // Aktifkan auto delete pesan periodik
+        this.autoDeleteIntervalMinutes = 5             // Interval dalam menit
+        this.autoDeleteVerificationEnabled = true        // Auto delete pesan verifikasi langsung
+        // Kata kunci untuk mendeteksi pesan verifikasi (case-insensitive)
+        this.verificationKeywords = ["verifikasi", "otp", "verification"]
 
-  async WAConnect() {
-    const { state, saveCreds } = await useMultiFileAuthState("creds");
+        // Array untuk menyimpan pesan yang pending untuk dihapus
+        this.pendingDeletion = []
 
-    this.sock = makeWASocket({
-      auth: state,
-      logger: this.logger,
-      version: [2, 2413, 1],
-    });
-
-    this.sock.ev.on("creds.update", saveCreds);
-
-    this.sock.ev.on("connection.update", (update) => {
-      const { connection, lastDisconnect, qr, pairingCode } = update;
-
-      if (connection === "close") {
-        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-        if (shouldReconnect) this.WAConnect();
-        this.status = 0;
-        this.qr = null;
-        this.pairingCode = null;
-      } else if (connection === "open") {
-        this.status = 3;
-        this.qr = null;
-        this.pairingCode = null;
-        this.startAutoDeleteCycle();
-      } else if (connection === "connecting") {
-        this.status = 2;
-      }
-
-      if (qr) {
-        this.qr = qr;
-        this.status = 1;
-
-        if (!process.env.DYNO) {
-          console.clear();
-          console.log("Scan QR ini untuk login WhatsApp:");
-          qrcodeTerminal.generate(qr, { small: true });
+        this.readCount()
+        
+        // Mulai timer auto delete jika fitur diaktifkan
+        if(this.autoDeleteEnabled){
+            // Cek tiap 1 menit, lalu cek apakah pesan sudah melebihi interval yang ditentukan
+            setInterval(() => {
+                let now = Date.now()
+                // Ambil pesan dengan delay lebih dari autoDeleteIntervalMinutes
+                let remaining = []
+                this.pendingDeletion.forEach(async (pending) => {
+                    if(now - pending.timestamp >= this.autoDeleteIntervalMinutes * 60000) {
+                        try {
+                            // Lakukan delete pesan
+                            await this.sock.readMessages([pending.key])
+                            await this.sock.chatModify({
+                                clear: {
+                                    messages: [{
+                                        id: pending.key.id,
+                                        fromMe: pending.key.fromMe,
+                                        timestamp: pending.timestamp / 1000 // pastikan sesuai format (detik)
+                                    }]
+                                }
+                            }, pending.jid, [])
+                            this.count += 1
+                            await writeCount(this.count)
+                            await writeLog("Auto delete (periodik) - From: " + pending.jid)
+                        } catch(e) {
+                            await writeLog("Error auto deleting pesan: " + e)
+                            remaining.push(pending)
+                        }
+                    } else {
+                        remaining.push(pending)
+                    }
+                })
+                this.pendingDeletion = remaining
+            }, 60000) // pengecekan tiap 60 detik
         }
-      }
+    }
 
-      if (pairingCode) {
-        this.pairingCode = pairingCode;
-        this.status = 4;
+    async readCount(){
+        this.count = await readCount()
+    }
 
-        if (!process.env.DYNO) {
-          console.clear();
-          console.log("Kode Pairing:");
-          console.log(pairingCode);
-          console.log("Buka WhatsApp > Perangkat Tertaut > Tautkan Perangkat");
-        }
-      }
-    });
+    async WAConnect() {
+        const { state, saveCreds } = await useMultiFileAuthState("creds")
+        this.sock = makeWASocket.default({
+            auth: state,
+            logger: this.logger
+        })
 
-    this.sock.ev.on("messages.upsert", async ({ messages }) => {
-      const msg = messages[0];
+        this.sock.ev.on("creds.update", saveCreds)
 
-      if (!msg.key.fromMe && msg.message) {
-        const content = JSON.stringify(msg.message).toLowerCase();
-
-        if (this.deletePatterns.some((pattern) => pattern.test(content))) {
-          await this.deleteMessage(msg.key.remoteJid, msg);
-
-          const adminJid = "628xxxxxxxxxx@s.whatsapp.net"; // Ganti dengan nomor admin
-          await this.sendText(
-            adminJid,
-            `🚨 Deleted message from ${msg.pushName}\n` +
-              `Waktu: ${moment().format("DD/MM/YYYY HH:mm:ss")}\n` +
-              `Pesan: ${content.substring(0, 50)}...`
-          );
-        }
-      }
-    });
-  }
-
-  startAutoDeleteCycle() {
-    if (this.autoDeleteTimer) clearInterval(this.autoDeleteTimer);
-
-    this.autoDeleteTimer = setInterval(async () => {
-      try {
-        const chats = await this.sock.fetchBlocklist();
-        for (const jid of chats) {
-          const messages = await this.sock.loadMessages(jid, 100);
-          for (const msg of messages) {
-            if (this.shouldDelete(msg)) {
-              await this.deleteMessage(jid, msg);
+        this.sock.ev.on("connection.update", (update) => {
+            const { connection, lastDisconnect } = update
+            if (connection === "close") {
+                const reconnect = lastDisconnect.error?.output?.payload?.statusCode !== DisconnectReason.loggedOut
+                if (reconnect) {
+                    this.WAConnect()
+                }
+                this.status = 0
+                this.qr = null
+                this.pairing = null
             }
-          }
-        }
-      } catch (error) {
-        console.error("Auto Delete Error:", error);
-      }
-    }, this.autoDeleteInterval * 60 * 1000);
-  }
+            else if (connection === "open") {
+                this.status = 3
+                this.qr = null
+                this.pairing = null
+            }
+            else {
+                // Jika update mengandung QR code atau pairing code
+                if(update.qr) {
+                    this.status = 1
+                    this.qr = update.qr
+                    this.pairing = null
+                }
+                else if(update.pairingCode) {
+                    this.status = 1
+                    this.pairing = update.pairingCode
+                    this.qr = null
+                }
+                else {
+                    this.status = 3
+                    this.qr = null
+                    this.pairing = null
+                }
+            }
+        })
 
-  updateInterval(minutes) {
-    this.autoDeleteInterval = minutes;
-    this.startAutoDeleteCycle();
-  }
+        this.sock.ev.on("messages.upsert", async (m) => {
+            let msgObj = m.messages[0]
+            let isRevoked = msgObj.hasOwnProperty("message") ? msgObj.message.hasOwnProperty("protocolMessage") ? true : false : false
+            // Proses hanya jika pesan bukan dari kita sendiri
+            if (!msgObj.key.fromMe) {
+                if (!isRevoked) {
+                    let isMessage = msgObj.hasOwnProperty("message") ? true : false
+                    let isImage = isMessage ? msgObj.message.hasOwnProperty("imageMessage") ? true : false : false
+                    let from = msgObj.key.remoteJid
+                    // Ambil pesan (caption untuk gambar atau text biasa)
+                    let msg = ""
+                    if(isMessage){
+                        if(isImage){
+                            msg = msgObj.message.imageMessage.caption || ""
+                        } else if(msgObj.message.hasOwnProperty("conversation")){
+                            msg = msgObj.message.conversation
+                        } else if(msgObj.message.hasOwnProperty("extendedTextMessage")){
+                            msg = msgObj.message.extendedTextMessage.text
+                        }
+                    }
 
-  shouldDelete(msg) {
-    try {
-      const content = JSON.stringify(msg.message || {}).toLowerCase();
-      return this.deletePatterns.some((pattern) => pattern.test(content));
-    } catch {
-      return false;
+                    // Cek untuk pesan dengan "wa.me/settings" dan hapus segera
+                    let regexSettings = /wa\.me\/settings/gi;
+                    if (regexSettings.test(msg)) {
+                        await this.sock.readMessages([msgObj.key])
+                        await this.sock.chatModify({
+                            clear: {
+                                messages: [{
+                                    id: msgObj.key.id,
+                                    fromMe: msgObj.key.fromMe,
+                                    timestamp: msgObj.messageTimestamp
+                                }]
+                            }
+                        }, from, [])
+                        this.count += 1
+                        await writeCount(this.count)
+                        await writeLog("From        : "+msgObj.key.remoteJid)
+                        await writeLog("PushName    : "+msgObj.pushName)
+                        await writeLog("Message     : "+msg)
+                        await writeLog(newline)
+                        return
+                    }
+                    
+                    // Cek untuk pesan verifikasi berdasarkan kata kunci
+                    let isVerification = false
+                    if(this.autoDeleteVerificationEnabled){
+                        for(let keyword of this.verificationKeywords){
+                            let regexVerif = new RegExp(keyword, "i")
+                            if(regexVerif.test(msg)){
+                                isVerification = true
+                                break
+                            }
+                        }
+                    }
+                    if(isVerification){
+                        await this.sock.readMessages([msgObj.key])
+                        await this.sock.chatModify({
+                            clear: {
+                                messages: [{
+                                    id: msgObj.key.id,
+                                    fromMe: msgObj.key.fromMe,
+                                    timestamp: msgObj.messageTimestamp
+                                }]
+                            }
+                        }, from, [])
+                        this.count += 1
+                        await writeCount(this.count)
+                        await writeLog("Auto delete (verifikasi) - From : "+msgObj.key.remoteJid)
+                        return
+                    }
+                    
+                    // Untuk pesan lain, jika auto delete aktif, simpan ke pendingDeletion
+                    if(this.autoDeleteEnabled) {
+                        this.pendingDeletion.push({
+                            key: msgObj.key,
+                            jid: from,
+                            timestamp: Date.now() // simpan waktu terima pesan
+                        })
+                    }
+
+                    // Respons untuk pesan "@isalive"
+                    if(msg.trim() == "@isalive"){
+                        await this.sock.readMessages([msgObj.key])
+                        setTimeout(() => this.sendText(from, "I am still Alive"), 1300)
+                    }
+                }
+            }
+        })
     }
-  }
 
-  async deleteMessage(jid, msg) {
-    try {
-      await this.sock.chatModify(
-        {
-          clear: {
-            messages: [
-              {
-                id: msg.key.id,
-                fromMe: msg.key.fromMe,
-                timestamp: msg.messageTimestamp,
-              },
-            ],
-          },
-        },
-        jid
-      );
-
-      this.count++;
-      await writeCount(this.count);
-      await writeLog(
-        [
-          `Waktu    : ${moment().format()}`,
-          `Dari     : ${jid}`,
-          `Pengirim : ${msg.pushName || "Unknown"}`,
-          `Pesan    : ${JSON.stringify(msg.message).substring(0, 100)}...`,
-          newline,
-        ].join(newline)
-      );
-    } catch (error) {
-      console.error("Delete Error:", error);
+    getCount() {
+        return this.count
     }
-  }
 
-  async sendText(jid, text) {
-    if (this.sock) {
-      await this.sock.sendMessage(jid, { text });
+    async sendText(jid, str) {
+        await this.sock.sendMessage(jid, { text: str })
     }
-  }
 }
